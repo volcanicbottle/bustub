@@ -41,13 +41,16 @@ auto LRUKReplacer::Evict() -> std::optional<frame_id_t> {
     } else {
       distance = current_timestamp_ - node.GetHistory().front();
     }
+    
+    size_t frame_oldest = node.GetHistory().empty() ? 0 : node.GetHistory().front();
+    
     if (distance > max_dis) {
       max_dis = distance;
       to_clear_frame = node.GetId();
-      oldest_stamp = node.GetHistory().empty() ? 0 : node.GetHistory().front();
+      oldest_stamp = frame_oldest;
     } else if (distance == max_dis && distance == std::numeric_limits<size_t>::max()) {
-      size_t frame_oldest = node.GetHistory().empty() ? 0 : node.GetHistory().front();
       if (frame_oldest < oldest_stamp) {
+        to_clear_frame = node.GetId();
         oldest_stamp = frame_oldest;
       }
     }
