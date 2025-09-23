@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "storage/page/page_guard.h"
+#include "common/config.h"
 
 namespace bustub {
 
@@ -21,7 +22,7 @@ namespace bustub {
  *
  * TODO(P1): Add implementation.
  *
- * @param page_id The page ID of the page we want to read.
+ * @param page_id The page ID of the page we want to reavb d.
  * @param frame A shared pointer to the frame that holds the page we want to protect.
  * @param replacer A shared pointer to the buffer pool manager's replacer.
  * @param bpm_latch A shared pointer to the buffer pool manager's latch.
@@ -29,7 +30,10 @@ namespace bustub {
 ReadPageGuard::ReadPageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> frame,
                              std::shared_ptr<LRUKReplacer> replacer, std::shared_ptr<std::mutex> bpm_latch)
     : page_id_(page_id), frame_(std::move(frame)), replacer_(std::move(replacer)), bpm_latch_(std::move(bpm_latch)) {
-  UNIMPLEMENTED("TODO(P1): Add implementation.");
+  if(frame_){
+    frame_->rwlatch_.lock_shared();
+    is_valid_=true;
+  }
 }
 
 /**
@@ -47,7 +51,18 @@ ReadPageGuard::ReadPageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> fra
  *
  * @param that The other page guard.
  */
-ReadPageGuard::ReadPageGuard(ReadPageGuard &&that) noexcept {}
+ReadPageGuard::ReadPageGuard(ReadPageGuard &&that) noexcept {
+  this->page_id_=that.page_id_;
+  frame_=std::move(that.frame_);
+  replacer_=std::move(that.replacer_);
+  bpm_latch_=std::move(that.bpm_latch_);
+  is_valid_=that.is_valid_;
+  that.page_id_=INVALID_PAGE_ID;
+  that.frame_=nullptr;
+  that.replacer_=nullptr;
+  that.bpm_latch_=nullptr;
+  is_valid_=false;
+}
 
 /**
  * @brief The move assignment operator for `ReadPageGuard`.
@@ -66,7 +81,26 @@ ReadPageGuard::ReadPageGuard(ReadPageGuard &&that) noexcept {}
  * @param that The other page guard.
  * @return ReadPageGuard& The newly valid `ReadPageGuard`.
  */
-auto ReadPageGuard::operator=(ReadPageGuard &&that) noexcept -> ReadPageGuard & { return *this; }
+auto ReadPageGuard::operator=(ReadPageGuard &&that) noexcept -> ReadPageGuard & { 
+  // 首先释放当前对象持有的资源
+  Drop();
+  
+  // 然后从 that 移动资源到当前对象
+  this->page_id_ = that.page_id_;
+  frame_ = std::move(that.frame_);
+  replacer_ = std::move(that.replacer_);
+  bpm_latch_ = std::move(that.bpm_latch_);
+  is_valid_ = that.is_valid_;
+  
+  // 使 that 对象无效化，防止双重释放
+  that.page_id_ = INVALID_PAGE_ID;
+  that.frame_ = nullptr;
+  that.replacer_ = nullptr;
+  that.bpm_latch_ = nullptr;
+  that.is_valid_ = false;
+  
+  return *this; 
+}
 
 /**
  * @brief Gets the page ID of the page this guard is protecting.
@@ -93,6 +127,8 @@ auto ReadPageGuard::IsDirty() const -> bool {
 }
 
 /**
+
+ 
  * @brief Manually drops a valid `ReadPageGuard`'s data. If this guard is invalid, this function does nothing.
  *
  * ### Implementation
@@ -103,7 +139,17 @@ auto ReadPageGuard::IsDirty() const -> bool {
  *
  * TODO(P1): Add implementation.
  */
-void ReadPageGuard::Drop() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+void ReadPageGuard::Drop() {
+  if(is_valid_ && frame_){
+    frame_->rwlatch_.unlock_shared();  // 只在有效时释放锁
+    is_valid_ = false;
+    page_id_ = INVALID_PAGE_ID;
+    frame_ = nullptr;
+    replacer_ = nullptr;
+    bpm_latch_ = nullptr;
+  }
+
+}
 
 /** @brief The destructor for `ReadPageGuard`. This destructor simply calls `Drop()`. */
 ReadPageGuard::~ReadPageGuard() { Drop(); }
@@ -127,7 +173,10 @@ ReadPageGuard::~ReadPageGuard() { Drop(); }
 WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> frame,
                                std::shared_ptr<LRUKReplacer> replacer, std::shared_ptr<std::mutex> bpm_latch)
     : page_id_(page_id), frame_(std::move(frame)), replacer_(std::move(replacer)), bpm_latch_(std::move(bpm_latch)) {
-  UNIMPLEMENTED("TODO(P1): Add implementation.");
+      if(frame_){
+        frame_->rwlatch_.lock();
+        is_valid_=true;
+      }
 }
 
 /**
@@ -145,7 +194,22 @@ WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> f
  *
  * @param that The other page guard.
  */
-WritePageGuard::WritePageGuard(WritePageGuard &&that) noexcept {}
+WritePageGuard::WritePageGuard(WritePageGuard &&that) noexcept {
+    // 和 ReadPageGuard 一样，直接移动资源
+    this->page_id_ = that.page_id_;
+    frame_ = std::move(that.frame_);
+    replacer_ = std::move(that.replacer_);
+    bpm_latch_ = std::move(that.bpm_latch_);
+    is_valid_ = that.is_valid_;
+    
+    // 使 that 无效化
+    that.page_id_ = INVALID_PAGE_ID;
+    that.frame_ = nullptr;
+    that.replacer_ = nullptr;
+    that.bpm_latch_ = nullptr;
+    that.is_valid_ = false;
+  }
+
 
 /**
  * @brief The move assignment operator for `WritePageGuard`.
@@ -164,7 +228,26 @@ WritePageGuard::WritePageGuard(WritePageGuard &&that) noexcept {}
  * @param that The other page guard.
  * @return WritePageGuard& The newly valid `WritePageGuard`.
  */
-auto WritePageGuard::operator=(WritePageGuard &&that) noexcept -> WritePageGuard & { return *this; }
+auto WritePageGuard::operator=(WritePageGuard &&that) noexcept -> WritePageGuard & { 
+  // 首先释放当前对象持有的资源
+  Drop();
+  // 从 that 移动资源到当前对象
+  this->page_id_ = that.page_id_;
+  frame_ = std::move(that.frame_);
+  replacer_ = std::move(that.replacer_);
+  bpm_latch_ = std::move(that.bpm_latch_);
+  is_valid_ = that.is_valid_;
+  
+  // 使 that 对象无效化
+  that.page_id_ = INVALID_PAGE_ID;
+  that.frame_ = nullptr;
+  that.replacer_ = nullptr;
+  that.bpm_latch_ = nullptr;
+  that.is_valid_ = false;
+  
+  return *this; 
+  return *this; 
+}
 
 /**
  * @brief Gets the page ID of the page this guard is protecting.
@@ -209,7 +292,18 @@ auto WritePageGuard::IsDirty() const -> bool {
  *
  * TODO(P1): Add implementation.
  */
-void WritePageGuard::Drop() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+void WritePageGuard::Drop() { 
+  if(is_valid_&&frame_){
+    frame_->rwlatch_.unlock();
+    is_valid_=false;
+    page_id_=INVALID_PAGE_ID;
+    frame_=nullptr;
+    replacer_=nullptr;
+    bpm_latch_=nullptr;
+  }
+
+
+}
 
 /** @brief The destructor for `WritePageGuard`. This destructor simply calls `Drop()`. */
 WritePageGuard::~WritePageGuard() { Drop(); }
