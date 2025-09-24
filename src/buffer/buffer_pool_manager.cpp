@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <utility>
+#include <future>
 #include "common/config.h"
 #include "storage/disk/disk_scheduler.h"
 #include "storage/page/page_guard.h"
@@ -234,29 +235,38 @@ auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
  * returns `std::nullopt`, otherwise returns a `WritePageGuard` ensuring exclusive and mutable access to a page's data.
  */
 auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_type) -> std::optional<WritePageGuard> {
+  std::shared_ptr<FrameHeader> frame;
+  {
   std::lock_guard<std::mutex>lock(*bpm_latch_);
   auto it =page_table_.find(page_id);
   if(it!=page_table_.end()){
     frame_id_t frame_id=it->second;
-    auto frame=frames_[frame_id];
+    frame=frames_[frame_id];
     frame->pin_count_.fetch_add(1);
-    return WritePageGuard(page_id,frame,replacer_,bpm_latch_);
-  }
-  if(!free_frames_.empty()){
+  }else if(!free_frames_.empty()){
     frame_id_t frame_id=free_frames_.front();
     free_frames_.pop_front();
-    auto frame=frames_[frame_id];
+    frame=frames_[frame_id];
+    // 设置I/O进行中标志
+    frame->io_done_ = false;
+    
+    // 创建promise和future来等待I/O完成
+    auto io_promise = disk_scheduler_->CreatePromise();
+    auto io_future = io_promise.get_future();
+
     DiskRequest r;
     r.page_id_=page_id;
     r.is_write_=false;
     r.data_=frame->GetDataMut();
-    r.callback_ = disk_scheduler_->CreatePromise();
+    r.callback_ = std::move(io_promise);
     disk_scheduler_->Schedule(std::move(r));
     page_table_[page_id]=frame_id;
     frame->pin_count_.store(1);
+    io_future.get();
+    frame->io_done_=true;
+    frame->cv_.notify_all();
 
-    return WritePageGuard(page_id,frame,replacer_,bpm_latch_);
-  }
+  }else{
   auto victim_frame_id=replacer_->Evict();
   if(!victim_frame_id.has_value()){
     return std::nullopt;
@@ -289,20 +299,35 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
     }
   }
   victim_frame->Reset();
+  
+  // 创建promise和future来等待I/O完成
+  auto io_promise = disk_scheduler_->CreatePromise();
+  auto io_future = io_promise.get_future();
+  
   DiskRequest read_request;
   read_request.is_write_ = false;
   read_request.data_ = victim_frame->GetDataMut();
   read_request.page_id_ = page_id;
-  read_request.callback_ = disk_scheduler_->CreatePromise();
+  read_request.callback_ = std::move(io_promise);
   disk_scheduler_->Schedule(std::move(read_request));
+  
+  // 等待I/O完成
+  io_future.get();
+  
+  // 设置I/O完成标志
+  victim_frame->io_done_ = true;
+  victim_frame->cv_.notify_all();
     
     // 更新页面表
   page_table_[page_id] = victim_frame_id.value();
   victim_frame->pin_count_.store(1);
   
-  return WritePageGuard(page_id, victim_frame, replacer_, bpm_latch_);
-
-
+  frame = victim_frame;
+  }
+  }
+  
+  // 在构造 PageGuard 之前释放 bpm_latch_，避免死锁
+  return WritePageGuard(page_id, frame, replacer_, bpm_latch_);
 }
 
 
@@ -331,80 +356,101 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
  * returns `std::nullopt`, otherwise returns a `ReadPageGuard` ensuring shared and read-only access to a page's data.
  */
 auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_type) -> std::optional<ReadPageGuard> {
-  std::lock_guard<std::mutex> lock(*bpm_latch_);
-  
-  auto it = page_table_.find(page_id);
-  if (it != page_table_.end()) {
-    frame_id_t frame_id = it->second;
-    auto frame = frames_[frame_id];
+  std::shared_ptr<FrameHeader> frame;
+  {
+  std::lock_guard<std::mutex>lock(*bpm_latch_);
+  auto it =page_table_.find(page_id);
+  if(it!=page_table_.end()){
+    frame_id_t frame_id=it->second;
+    frame=frames_[frame_id];
     frame->pin_count_.fetch_add(1);
-    return ReadPageGuard(page_id, frame, replacer_, bpm_latch_);
-  }
-  
-  if (!free_frames_.empty()) {
-    frame_id_t frame_id = free_frames_.front();
+  }else if(!free_frames_.empty()){
+    frame_id_t frame_id=free_frames_.front();
     free_frames_.pop_front();
-    auto frame = frames_[frame_id];
+    frame=frames_[frame_id];
+    // 设置I/O进行中标志
+    frame->io_done_ = false;
     
+    // 创建promise和future来等待I/O完成
+    auto io_promise = disk_scheduler_->CreatePromise();
+    auto io_future = io_promise.get_future();
+
     DiskRequest r;
-    r.page_id_ = page_id;
-    r.is_write_ = false;
-    r.data_ = frame->GetDataMut();
-    r.callback_ = disk_scheduler_->CreatePromise();
+    r.page_id_=page_id;
+    r.is_write_=false;
+    r.data_=frame->GetDataMut();
+    r.callback_ = std::move(io_promise);
     disk_scheduler_->Schedule(std::move(r));
-    
-    page_table_[page_id] = frame_id;
+    page_table_[page_id]=frame_id;
     frame->pin_count_.store(1);
-    return ReadPageGuard(page_id, frame, replacer_, bpm_latch_);
-  }
-  
-  auto victim_opt = replacer_->Evict();
-  if (!victim_opt.has_value()) {
+    io_future.get();
+    frame->io_done_=true;
+    frame->cv_.notify_all();
+
+  }else{
+  auto victim_frame_id=replacer_->Evict();
+  if(!victim_frame_id.has_value()){
     return std::nullopt;
   }
-  
-  frame_id_t victim_frame_id = victim_opt.value();
-  auto victim_frame = frames_[victim_frame_id];
-  
-  if (victim_frame->is_dirty_) {
-    page_id_t victim_page_id = INVALID_PAGE_ID;
-    for (auto& [pid, fid] : page_table_) {
-      if (fid == victim_frame_id) {
-        victim_page_id = pid;
-        break;
-      }
-    }
-    
-    if (victim_page_id != INVALID_PAGE_ID) {
-      DiskRequest write_request;
-      write_request.page_id_ = victim_page_id;
-      write_request.is_write_ = true;
-      write_request.data_ = victim_frame->GetDataMut();
-      disk_scheduler_->Schedule(std::move(write_request));
-    }
+  auto victim_frame=frames_[victim_frame_id.value()];
+  if (victim_frame->is_dirty_){
+     page_id_t victim_page_id=INVALID_PAGE_ID;
+     for(auto&[pid,fid]:page_table_){
+        if(fid==victim_frame_id){
+          victim_page_id=pid;
+          break;
+
+        }
+     }
+
+     if(victim_page_id!=INVALID_PAGE_ID){
+       DiskRequest r;
+       r.page_id_=victim_page_id;
+       r.is_write_=true;
+       r.data_=victim_frame->GetDataMut();
+       r.callback_=disk_scheduler_->CreatePromise();
+       disk_scheduler_->Schedule(std::move(r));
+       
+     }
   }
-  
   for (auto it = page_table_.begin(); it != page_table_.end(); ++it) {
     if (it->second == victim_frame_id) {
-      page_table_.erase(it);
-      break;
+        page_table_.erase(it);
+        break;
     }
   }
-  
   victim_frame->Reset();
+  
+  // 创建promise和future来等待I/O完成
+  auto io_promise = disk_scheduler_->CreatePromise();
+  auto io_future = io_promise.get_future();
   
   DiskRequest read_request;
   read_request.is_write_ = false;
   read_request.data_ = victim_frame->GetDataMut();
   read_request.page_id_ = page_id;
-  read_request.callback_ = disk_scheduler_->CreatePromise();
+  read_request.callback_ = std::move(io_promise);
   disk_scheduler_->Schedule(std::move(read_request));
   
-  page_table_[page_id] = victim_frame_id;
+  // 等待I/O完成
+  io_future.get();
+  
+  // 设置I/O完成标志
+  victim_frame->io_done_ = true;
+  victim_frame->cv_.notify_all();
+    
+    // 更新页面表
+  page_table_[page_id] = victim_frame_id.value();
   victim_frame->pin_count_.store(1);
   
-  return ReadPageGuard(page_id, victim_frame, replacer_, bpm_latch_);
+  frame = victim_frame;
+  }
+  }
+  
+  // 在构造 PageGuard 之前释放 bpm_latch_，避免死锁
+  return ReadPageGuard(page_id, frame, replacer_, bpm_latch_);
 }
+
 
 /**
  * @brief A wrapper around `CheckedWritePage` that unwraps the inner value if it exists.
@@ -490,7 +536,11 @@ auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
     disk_scheduler_->Schedule(std::move(write_request));
     
     frame->is_dirty_ = false;  // 标记为不脏
+
   }
+
+
+  
   
   return true;
 }

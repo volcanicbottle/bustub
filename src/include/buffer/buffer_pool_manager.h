@@ -70,6 +70,11 @@ class FrameHeader {
    * currently storing. This might allow you to skip searching for the corresponding (page ID, frame ID) pair somewhere
    * else in the buffer pool manager...
    */
+  
+  // I/O synchronization fields
+  std::mutex m_;
+  std::condition_variable cv_;
+  bool io_done_ = true;
 };
 
 /**
