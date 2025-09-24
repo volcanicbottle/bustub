@@ -246,7 +246,7 @@ auto WritePageGuard::operator=(WritePageGuard &&that) noexcept -> WritePageGuard
   that.is_valid_ = false;
   
   return *this; 
-  return *this; 
+
 }
 
 /**

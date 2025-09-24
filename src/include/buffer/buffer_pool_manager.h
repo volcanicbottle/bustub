@@ -31,31 +31,6 @@ class BufferPoolManager;
 class ReadPageGuard;
 class WritePageGuard;
 
-/**
- * @brief A helper class for `BufferPoolManager` that manages a frame of memory and related metadata.
- *
- * This class represents headers for frames of memory that the `BufferPoolManager` stores pages of data into. Note that
- * the actual frames of memory are not stored directly inside a `FrameHeader`, rather the `FrameHeader`s store pointer
- * to the frames and are stored separately them.
- *
- * ---
- *
- * Something that may (or may not) be of interest to you is why the field `data_` is stored as a vector that is
- * allocated on the fly instead of as a direct pointer to some pre-allocated chunk of memory.
- *
- * In a traditional production buffer pool manager, all memory that the buffer pool is intended to manage is allocated
- * in one large contiguous array (think of a very large `malloc` call that allocates several gigabytes of memory up
- * front). This large contiguous block of memory is then divided into contiguous frames. In other words, frames are
- * defined by an offset from the base of the array in page-sized (4 KB) intervals.
- *
- * In BusTub, we instead allocate each frame on its own (via a `std::vector<char>`) in order to easily detect buffer
- * overflow with address sanitizer. Since C++ has no notion of memory safety, it would be very easy to cast a page's
- * data pointer into some large data type and start overwriting other pages of data if they were all contiguous.
- *
- * If you would like to attempt to use more efficient data structures for your buffer pool manager, you are free to do
- * so. However, you will likely benefit significantly from detecting buffer overflow in future projects (especially
- * project 2).
- */
 class FrameHeader {
   friend class BufferPoolManager;
   friend class ReadPageGuard;
@@ -170,5 +145,8 @@ class BufferPoolManager {
    * stored inside of it. Additionally, you may also want to implement a helper function that returns either a shared
    * pointer to a `FrameHeader` that already has a page's data stored inside of it, or an index to said `FrameHeader`.
    */
+  
+  // Helper function to get page frame with early BPM lock release
+  auto GetPageFrame(page_id_t page_id) -> std::optional<std::shared_ptr<FrameHeader>>;
 };
 }  // namespace bustub
