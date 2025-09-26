@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "buffer/buffer_pool_manager.h"
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -181,11 +182,15 @@ auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
   page_table_.erase(it);
   
   if (frame->is_dirty_) {
+    auto p = disk_scheduler_->CreatePromise();
+    auto fut = p.get_future();
     DiskRequest write_request;
     write_request.page_id_ = page_id;
     write_request.is_write_ = true;
     write_request.data_ = frame->GetDataMut();
+    write_request.callback_ = std::move(p);
     disk_scheduler_->Schedule(std::move(write_request));
+    fut.get();  // 等待刷写完成
   }
   
   frame->Reset();
@@ -266,8 +271,15 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType) -> std::
           if (kv.second == fid) { old = kv.first; break; }
         }
         if (old != INVALID_PAGE_ID) {
-          FlushPage(old);
+          if (frames_[fid]->is_dirty_) {
+          // 在锁内同步刷写
+            auto p = disk_scheduler_->CreatePromise();
+            auto f = p.get_future();
+            disk_scheduler_->Schedule({true, frames_[fid]->GetDataMut(), old, std::move(p)});
+            f.get();  // 等待完成，虽然在锁内但保证数据正确性
+          }
           page_table_.erase(old);
+        
         }
       }
       page_table_[page_id] = fid;
@@ -349,7 +361,8 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType) -> std::o
           if (kv.second == fid) { old = kv.first; break; }
         }
         if (old != INVALID_PAGE_ID) {
-          FlushPage(old);
+          // 先标记为脏，稍后刷新
+          frames_[fid]->is_dirty_ = true;
           page_table_.erase(old);
         }
       }
@@ -442,22 +455,26 @@ auto BufferPoolManager::ReadPage(page_id_t page_id, AccessType access_type) -> R
  * @return `false` if the page could not be found in the page table, otherwise `true`.
  */
 auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
-  std::lock_guard<std::mutex> lock(*bpm_latch_);
+  std::shared_ptr<FrameHeader>frame;
+  {std::lock_guard<std::mutex> lock(*bpm_latch_);
   
   auto it = page_table_.find(page_id);
   if (it == page_table_.end()) {
     return false;  // 页面不在内存中
   }
   frame_id_t frame_id = it->second;
-  auto frame = frames_[frame_id];
-  
+  frame = frames_[frame_id];
+}
   if (frame->is_dirty_) {
+    auto p = disk_scheduler_->CreatePromise();
+    auto fut = p.get_future();
     DiskRequest write_request;
     write_request.page_id_ = page_id;
     write_request.is_write_ = true;
     write_request.data_ = frame->GetDataMut();
+    write_request.callback_=std::move(p);
     disk_scheduler_->Schedule(std::move(write_request));
-    
+    fut.get();
     frame->is_dirty_ = false;  // 标记为不脏
 
   }
@@ -479,14 +496,25 @@ auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
  * TODO(P1): Add implementation
  */
 void BufferPoolManager::FlushAllPages() { 
-  std::lock_guard<std::mutex>lock(*bpm_latch_);
-  for(auto&[page_id,frame_id]:page_table_){
+  std::vector<std::pair<page_id_t, std::shared_ptr<FrameHeader>>> todo;
+  { std::lock_guard<std::mutex> g(*bpm_latch_);
+    for (auto &[pid, fid] : page_table_) {
+      if(!frames_[fid]->is_dirty_)continue;
+      todo.emplace_back(pid, frames_[fid]);   // 收集 (page_id, frame)
+    }
+  } 
+  for(auto&[page_id,frame]:todo){
+    
+    auto p = disk_scheduler_->CreatePromise();
+    auto fut = p.get_future();
     DiskRequest r;
     r.is_write_=true;
-    r.data_=frames_[frame_id]->GetDataMut();
+    r.data_=frame->GetDataMut();
     r.page_id_=page_id;
+    r.callback_=std::move(p);
     disk_scheduler_->Schedule(std::move(r));
-    frames_[frame_id]->is_dirty_=false;
+    fut.get();
+    frame->is_dirty_=false;
   }
 }
 
