@@ -361,8 +361,19 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType) -> std::o
           if (kv.second == fid) { old = kv.first; break; }
         }
         if (old != INVALID_PAGE_ID) {
-          // 先标记为脏，稍后刷新
-          frames_[fid]->is_dirty_ = true;
+          // 如果页面是脏的，需要刷新到磁盘
+          if (frames_[fid]->is_dirty_) {
+            // 在释放锁之前刷新脏页面
+            DiskRequest flush_request;
+            flush_request.page_id_ = old;
+            flush_request.is_write_ = true;
+            flush_request.data_ = frames_[fid]->GetDataMut();
+            auto flush_promise = disk_scheduler_->CreatePromise();
+            auto flush_future = flush_promise.get_future();
+            flush_request.callback_ = std::move(flush_promise);
+            disk_scheduler_->Schedule(std::move(flush_request));
+            flush_future.get(); // 等待刷新完成
+          }
           page_table_.erase(old);
         }
       }

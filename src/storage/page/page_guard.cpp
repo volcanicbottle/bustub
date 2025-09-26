@@ -304,6 +304,7 @@ void WritePageGuard::Drop() {
   // 先释放小锁（frame 写锁）
   frame_->rwlatch_.unlock();
   is_valid_ = false;
+  frame_->is_dirty_=true;
   page_id_ = INVALID_PAGE_ID;
 
   // 在 bpm 大锁下把 unpin 与 SetEvictable 绑在一起
@@ -312,6 +313,8 @@ void WritePageGuard::Drop() {
   if (prev == 1) {
     replacer_->SetEvictable(frame_->frame_id_, true);
   }
+
+  
 
   frame_ = nullptr;
   replacer_ = nullptr;
