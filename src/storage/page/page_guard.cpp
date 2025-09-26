@@ -140,16 +140,20 @@ auto ReadPageGuard::IsDirty() const -> bool {
  */
 
 void ReadPageGuard::Drop() {
-  if(!is_valid_) return;
+  if (!is_valid_) return;
+
+  // 先释放小锁（frame 共享锁）
   frame_->rwlatch_.unlock_shared();
   is_valid_ = false;
   page_id_ = INVALID_PAGE_ID;
-  bpm_latch_->lock();
-  frame_->pin_count_--;
-  if(frame_->pin_count_ == 0){
+
+  // 在 bpm 大锁下把 unpin 与 SetEvictable 绑在一起
+  std::lock_guard<std::mutex> g(*bpm_latch_);
+  auto prev = frame_->pin_count_.fetch_sub(1);  // 原子
+  if (prev == 1) {
     replacer_->SetEvictable(frame_->frame_id_, true);
   }
-  bpm_latch_->unlock();
+
   frame_ = nullptr;
   replacer_ = nullptr;
   bpm_latch_ = nullptr;
@@ -295,17 +299,20 @@ void WritePageGuard::Drop() {
   if (!is_valid_) {
     return;
   }
+
+
+  // 先释放小锁（frame 写锁）
+  frame_->rwlatch_.unlock();
   is_valid_ = false;
   page_id_ = INVALID_PAGE_ID;
 
-  frame_->rwlatch_.unlock();
-
-  bpm_latch_->lock();
-  frame_->pin_count_--;
-  if (frame_->pin_count_.load() == 0) {
+  // 在 bpm 大锁下把 unpin 与 SetEvictable 绑在一起
+  std::lock_guard<std::mutex> g(*bpm_latch_);
+  auto prev = frame_->pin_count_.fetch_sub(1);  // 原子
+  if (prev == 1) {
     replacer_->SetEvictable(frame_->frame_id_, true);
   }
-  bpm_latch_->unlock();
+
   frame_ = nullptr;
   replacer_ = nullptr;
   bpm_latch_ = nullptr;
