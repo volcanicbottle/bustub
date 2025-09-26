@@ -483,7 +483,7 @@ void BufferPoolManager::FlushAllPages() {
   for(auto&[page_id,frame_id]:page_table_){
     DiskRequest r;
     r.is_write_=true;
-    r.data_=frames_[page_id]->GetDataMut();
+    r.data_=frames_[frame_id]->GetDataMut();
     r.page_id_=page_id;
     disk_scheduler_->Schedule(std::move(r));
     frames_[frame_id]->is_dirty_=false;
