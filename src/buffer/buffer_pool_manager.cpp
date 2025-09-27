@@ -6,18 +6,18 @@
 //
 // Identification: src/buffer/buffer_pool_manager.cpp
 //
-// Copyright (c) 2015-2024, Carnegie Mellon University Database Group
+// Copyright (c) 2015-2025, Carnegie Mellon University Database Group
 //
 //===----------------------------------------------------------------------===//
 
 #include "buffer/buffer_pool_manager.h"
-#include <memory>
+#include <future>
 #include <mutex>
 #include <optional>
-#include <utility>
-#include <future>
+#include <shared_mutex>
+#include "buffer/lru_k_replacer.h"
 #include "common/config.h"
-#include "storage/disk/disk_scheduler.h"
+#include "common/logger.h"
 #include "storage/page/page_guard.h"
 
 namespace bustub {
@@ -29,7 +29,10 @@ namespace bustub {
  *
  * @param frame_id The frame ID / index of the frame we are creating a header for.
  */
-FrameHeader::FrameHeader(frame_id_t frame_id) : frame_id_(frame_id), data_(BUSTUB_PAGE_SIZE, 0) { Reset(); }
+FrameHeader::FrameHeader(frame_id_t frame_id)
+    : frame_id_(frame_id), data_(BUSTUB_PAGE_SIZE, 0), page_id_(INVALID_PAGE_ID) {
+  Reset();
+}
 
 /**
  * @brief Get a raw const pointer to the frame's data.
@@ -49,6 +52,7 @@ auto FrameHeader::GetDataMut() -> char * { return data_.data(); }
  * @brief Resets a `FrameHeader`'s member fields.
  */
 void FrameHeader::Reset() {
+  page_id_ = INVALID_PAGE_ID;
   std::fill(data_.begin(), data_.end(), 0);
   pin_count_.store(0);
   is_dirty_ = false;
@@ -120,23 +124,73 @@ auto BufferPoolManager::Size() const -> size_t { return num_frames_; }
  * You will maintain a thread-safe, monotonically increasing counter in the form of a `std::atomic<page_id_t>`.
  * See the documentation on [atomics](https://en.cppreference.com/w/cpp/atomic/atomic) for more information.
  *
- * Also, make sure to read the documentation for `DeletePage`! You can assume that you will never run out of disk
- * space (via `DiskScheduler::IncreaseDiskSpace`), so this function _cannot_ fail.
- *
- * Once you have allocated the new page via the counter, make sure to call `DiskScheduler::IncreaseDiskSpace` so you
- * have enough space on disk!
- *
  * TODO(P1): Add implementation.
  *
  * @return The page ID of the newly allocated page.
  */
-auto BufferPoolManager::NewPage() -> page_id_t { 
-  std::lock_guard<std::mutex> lock(*bpm_latch_); 
-  page_id_t new_page_id=next_page_id_.fetch_add(1);
-  disk_scheduler_->IncreaseDiskSpace(new_page_id+1);
-  return new_page_id;
+auto BufferPoolManager::NewPage() -> page_id_t {
+  // LOG_DEBUG("获取新页");
+  // 1.加锁
+  std::scoped_lock<std::mutex> lk(*bpm_latch_);
 
- }
+  // 2.查找可用内存帧
+  frame_id_t frame_id;
+  if (!free_frames_.empty()) {
+    frame_id = free_frames_.front();
+    free_frames_.pop_front();
+  } else {
+    auto maybe_frame_id = replacer_->Evict();
+    if (!maybe_frame_id.has_value()) {
+      // LOG_ERROR("淘汰失败，无法分配新页");
+      return INVALID_PAGE_ID;  // 淘汰失败，无法分配新页
+    }
+    // 获取目标帧头
+    frame_id = maybe_frame_id.value();
+    auto &frame = frames_[frame_id];
+    std::lock_guard<std::shared_mutex> wtire_lock(frame->rwlatch_);
+
+    // 目标帧头是否为脏页
+
+    // if (frame->is_dirty_) {
+    std::promise<bool> write_promise;
+    auto write_future = write_promise.get_future();
+    // 调度写请求
+    disk_scheduler_->Schedule({true, frame->GetDataMut(), frame->page_id_, std::move(write_promise)});
+    // 等待写请求执行
+    if (!write_future.get()) {
+      LOG_ERROR("Disk write failed during page eviction");
+      return INVALID_PAGE_ID;
+    }
+
+    frame->is_dirty_ = false;
+    //}
+
+    // 从页表中删除被淘汰的页面
+    if (frame->page_id_ != INVALID_PAGE_ID) {
+      page_table_.erase(frame->page_id_);
+      frame->page_id_ = INVALID_PAGE_ID;  // 重置页ID
+    }
+    // 重置帧状态
+    frame->Reset();
+  }
+  // 3.生成新页面ID（原子操作保证线程安全）
+  // TODO(P1): 内存序可能要修改
+  const page_id_t new_page_id = next_page_id_.fetch_add(1, std::memory_order_relaxed);
+
+  // 4.绑定新页与帧
+  auto &new_frame = frames_[frame_id];
+  std::lock_guard<std::shared_mutex> new_write_lk(new_frame->rwlatch_);
+  new_frame->pin_count_ = 0;
+  new_frame->is_dirty_ = false;
+  new_frame->page_id_ = new_page_id;
+  page_table_[new_page_id] = frame_id;  // 更新页表
+
+  // 5.将新帧加入替换器
+  // replacer_->RecordAccess(frame_id);
+  // replacer_->SetEvictable(frame_id, false);
+
+  return new_page_id;
+}
 
 /**
  * @brief Removes a page from the database, both on disk and in memory.
@@ -150,14 +204,7 @@ auto BufferPoolManager::NewPage() -> page_id_t {
  * function. You will probably want to implement this function _after_ you have implemented `CheckedReadPage` and
  * `CheckedWritePage`.
  *
- * Ideally, we would want to ensure that all space on disk is used efficiently. That would mean the space that deleted
- * pages on disk used to occupy should somehow be made available to new pages allocated by `NewPage`.
- *
- * If you would like to attempt this, you are free to do so. However, for this implementation, you are allowed to
- * assume you will not run out of disk space and simply keep allocating disk space upwards in `NewPage`.
- *
- * For (nonexistent) style points, you can still call `DeallocatePage` in case you want to implement something slightly
- * more space-efficient in the future.
+ * You should call `DeallocatePage` in the disk scheduler to make the space available for new pages.
  *
  * TODO(P1): Add implementation.
  *
@@ -165,38 +212,61 @@ auto BufferPoolManager::NewPage() -> page_id_t {
  * @return `false` if the page exists but could not be deleted, `true` if the page didn't exist or deletion succeeded.
  */
 auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
-  std::lock_guard<std::mutex> lock(*bpm_latch_);
-  
+  // LOG_DEBUG("删除指定页");
+  std::unique_lock<std::mutex> lk(*bpm_latch_);
+
+  // 检查页表中是否存在该页面
   auto it = page_table_.find(page_id);
   if (it == page_table_.end()) {
+    // 页面不存在于缓冲池中，直接返回true（因为不存在所以可以认为删除成功）
     return true;
   }
-  
+
+  // 获取页面所在的帧头
   frame_id_t frame_id = it->second;
-  auto frame = frames_[frame_id];
-  
-  if (frame->pin_count_.load() > 0) {
+  auto &frame = frames_[frame_id];
+
+  // 该页是否被其他线程访问
+  if (frame->pin_count_ > 0) {
     return false;
   }
-  
-  page_table_.erase(it);
-  
+
+  // 页面未被锁定，可以删除
+  // 先处理脏页，如果是脏页则写回磁盘
+  // std::lock_guard<std::shared_mutex> write_lk(frame->rwlatch_);
+  // if (frame->is_dirty_) {
+  //   std::promise<bool> write_promise;
+  //   auto write_future = write_promise.get_future();
+  //   // 构造写请求
+  //   disk_scheduler_->Schedule({true, frame->GetDataMut(), frame->page_id_, std::move(write_promise)});
+
+  //   if (!write_future.get()) {
+  //     LOG_ERROR("Disk write failed during page deletion");
+  //     return false;
+  //   }
+
+  //   frame->is_dirty_ = false;
+  // }
+  lk.unlock();
+  // 写回脏页
   if (frame->is_dirty_) {
-    auto p = disk_scheduler_->CreatePromise();
-    auto fut = p.get_future();
-    DiskRequest write_request;
-    write_request.page_id_ = page_id;
-    write_request.is_write_ = true;
-    write_request.data_ = frame->GetDataMut();
-    write_request.callback_ = std::move(p);
-    disk_scheduler_->Schedule(std::move(write_request));
-    fut.get();  // 等待刷写完成
+    FlushPage(page_id);
   }
-  
-  frame->Reset();
-  free_frames_.push_back(frame_id);
-  replacer_->Remove(frame_id);
-  
+  lk.lock();
+  // 重新查找迭代器
+  it = page_table_.find(page_id);
+  if (it == page_table_.end() || it->second != frame_id) {
+    return true;
+  }
+  if (frame->pin_count_ > 0) {
+    return false;
+  }
+  page_table_.erase(it);             // 从页表中删除该页面的映射
+  free_frames_.push_back(frame_id);  // 将该帧标记为空闲
+  replacer_->SetEvictable(frame_id, false);
+  disk_scheduler_->DeallocatePage(page_id);  // 释放磁盘空间
+  frame->Reset();                            // 重置帧的状态
+
   return true;
 }
 
@@ -239,77 +309,91 @@ auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
  * @return std::optional<WritePageGuard> An optional latch guard where if there are no more free frames (out of memory)
  * returns `std::nullopt`, otherwise returns a `WritePageGuard` ensuring exclusive and mutable access to a page's data.
  */
-auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType) -> std::optional<WritePageGuard> {
-  std::shared_ptr<FrameHeader> frame;
-  bool do_read = false;
+auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_type) -> std::optional<WritePageGuard> {
+  // LOG_DEBUG("获取受保护的写页");
+  std::unique_lock<std::mutex> lk(*bpm_latch_);
 
-  {
-    std::lock_guard<std::mutex> guard(*bpm_latch_);
-    auto it = page_table_.find(page_id);
-    if (it != page_table_.end()) {
-      // 命中
-      frame = frames_[it->second];
-      frame->pin_count_.fetch_add(1);
-      replacer_->RecordAccess(it->second);
-      replacer_->SetEvictable(it->second, false);
-    } else {
-      // miss path
-      frame_id_t fid;
-      if (!free_frames_.empty()) {
-        fid = free_frames_.front();
-        free_frames_.pop_front();
-      } else {
-        auto victim = replacer_->Evict();
-        if (!victim.has_value()) {
-          return std::nullopt;
-        }
-        fid = victim.value();
+  // 1.检查页面是否已在缓冲池中
+  auto it = page_table_.find(page_id);
+  if (it != page_table_.end()) {
+    // 获取内存中的页
+    frame_id_t frame_id = it->second;
+    auto &frame = frames_[frame_id];
 
-        // flush old if dirty, remove mapping
-        page_id_t old = INVALID_PAGE_ID;
-        for (auto &kv : page_table_) {
-          if (kv.second == fid) { old = kv.first; break; }
-        }
-        if (old != INVALID_PAGE_ID) {
-          if (frames_[fid]->is_dirty_) {
-          // 在锁内同步刷写
-            auto p = disk_scheduler_->CreatePromise();
-            auto f = p.get_future();
-            disk_scheduler_->Schedule({true, frames_[fid]->GetDataMut(), old, std::move(p)});
-            f.get();  // 等待完成，虽然在锁内但保证数据正确性
-          }
-          page_table_.erase(old);
-        
-        }
-      }
-      page_table_[page_id] = fid;
-      frame = frames_[fid];
-      frame->pin_count_.store(1);
-      frame->is_dirty_ = false;
-      replacer_->RecordAccess(fid);
-      replacer_->SetEvictable(fid, false);
-      do_read = true;
-    }
-  }  // 释放 bpm_latch_
+    // 记录访问
+    replacer_->RecordAccess(frame_id);
+    replacer_->SetEvictable(frame_id, false);
+    frame->pin_count_++;
 
-  if (do_read) {
-    auto p = disk_scheduler_->CreatePromise();
-    auto f = p.get_future();
-    disk_scheduler_->Schedule({false, frame->GetDataMut(), page_id, std::move(p)});
-    f.get();
+    lk.unlock();
+    return std::make_optional(WritePageGuard(page_id, frame, replacer_, bpm_latch_));
   }
 
-  // 此时 bpm_latch_ 已被释放，可以安全构造 Guard（Guard 自带加锁逻辑）
-  return WritePageGuard(page_id, frame, replacer_, bpm_latch_);
-}
+  // 2. 页面不在内存中，尝试分配或淘汰帧
+  frame_id_t frame_id;
+  if (!free_frames_.empty()) {
+    frame_id = free_frames_.front();
+    free_frames_.pop_front();
+  } else {
+    auto maybe_evict_id = replacer_->Evict();
+    if (!maybe_evict_id.has_value()) {
+      return std::nullopt;
+    }
+    frame_id = maybe_evict_id.value();
+    auto &evict_frame = frames_[frame_id];
 
+    // 处理脏页
+    std::lock_guard<std::shared_mutex> write_lk(evict_frame->rwlatch_);
+    if (evict_frame->is_dirty_) {
+      std::promise<bool> write_promise;
+      auto write_future = write_promise.get_future();
+      disk_scheduler_->Schedule({true, evict_frame->GetDataMut(), evict_frame->page_id_, std::move(write_promise)});
+      if (!write_future.get()) {
+        LOG_ERROR("Disk write failed during page deletion");
+        return std::nullopt;
+      }
+      evict_frame->is_dirty_ = false;
+    }
+
+    // 从页表中删除被淘汰的页面
+    page_table_.erase(evict_frame->page_id_);
+    evict_frame->Reset();
+    replacer_->SetEvictable(frame_id, false);
+  }
+
+  // 3. 从磁盘读取目标页面到刚才分配或淘汰的帧中
+  auto &target_frame = frames_[frame_id];
+  // 获取读锁
+  std::unique_lock<std::shared_mutex> read_lk(target_frame->rwlatch_);
+  std::promise<bool> read_promise;
+  auto read_future = read_promise.get_future();
+  disk_scheduler_->Schedule({false, target_frame->GetDataMut(), page_id, std::move(read_promise)});
+  if (!read_future.get()) {
+    // 读盘失败，释放资源
+    LOG_ERROR("读盘失败");
+    free_frames_.push_back(frame_id);
+    replacer_->SetEvictable(frame_id, true);
+    return std::nullopt;
+  }
+
+  // 4. 更新缓冲池元数据
+  page_table_[page_id] = frame_id;
+  target_frame->page_id_ = page_id;
+  target_frame->pin_count_ = 1;
+  target_frame->is_dirty_ = false;
+  replacer_->RecordAccess(frame_id);
+  replacer_->SetEvictable(frame_id, false);
+
+  read_lk.unlock();
+  lk.unlock();
+  return std::make_optional(WritePageGuard(page_id, target_frame, replacer_, bpm_latch_));
+}
 
 /**
  * @brief Acquires an optional read-locked guard over a page of data. The user can specify an `AccessType` if needed.
  *
  * If it is not possible to bring the page of data into memory, this function will return a `std::nullopt`.
  *
- 
  * Page data can _only_ be accessed via page guards. Users of this `BufferPoolManager` are expected to acquire either a
  * `ReadPageGuard` or a `WritePageGuard` depending on the mode in which they would like to access the data, which
  * ensures that any access of data is thread-safe.
@@ -329,75 +413,85 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType) -> std::
  * @return std::optional<ReadPageGuard> An optional latch guard where if there are no more free frames (out of memory)
  * returns `std::nullopt`, otherwise returns a `ReadPageGuard` ensuring shared and read-only access to a page's data.
  */
-auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType) -> std::optional<ReadPageGuard> {
-  std::shared_ptr<FrameHeader> frame;
-  bool do_read = false;
+auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_type) -> std::optional<ReadPageGuard> {
+  // LOG_DEBUG("获取受保护的读页");
+  std::unique_lock<std::mutex> lk(*bpm_latch_);
 
-  {
-    std::lock_guard<std::mutex> guard(*bpm_latch_);
-    auto it = page_table_.find(page_id);
-    if (it != page_table_.end()) {
-      // 命中
-      frame = frames_[it->second];
-      frame->pin_count_.fetch_add(1);
-      replacer_->RecordAccess(it->second);
-      replacer_->SetEvictable(it->second, false);
-    } else {
-      // miss path
-      frame_id_t fid;
-      if (!free_frames_.empty()) {
-        fid = free_frames_.front();
-        free_frames_.pop_front();
-      } else {
-        auto victim = replacer_->Evict();
-        if (!victim.has_value()) {
-          return std::nullopt;
-        }
-        fid = victim.value();
+  // 1.检查页面是否已在缓冲池中
+  auto it = page_table_.find(page_id);
+  if (it != page_table_.end()) {
+    frame_id_t frame_id = it->second;
+    auto &frame = frames_[frame_id];
 
-        // flush old if dirty, remove mapping
-        page_id_t old = INVALID_PAGE_ID;
-        for (auto &kv : page_table_) {
-          if (kv.second == fid) { old = kv.first; break; }
-        }
-        if (old != INVALID_PAGE_ID) {
-          // 如果页面是脏的，需要刷新到磁盘
-          if (frames_[fid]->is_dirty_) {
-            // 在释放锁之前刷新脏页面
-            DiskRequest flush_request;
-            flush_request.page_id_ = old;
-            flush_request.is_write_ = true;
-            flush_request.data_ = frames_[fid]->GetDataMut();
-            auto flush_promise = disk_scheduler_->CreatePromise();
-            auto flush_future = flush_promise.get_future();
-            flush_request.callback_ = std::move(flush_promise);
-            disk_scheduler_->Schedule(std::move(flush_request));
-            flush_future.get(); // 等待刷新完成
-          }
-          page_table_.erase(old);
-        }
-      }
-      page_table_[page_id] = fid;
-      frame = frames_[fid];
-      frame->pin_count_.store(1);
-      frame->is_dirty_ = false;
-      replacer_->RecordAccess(fid);
-      replacer_->SetEvictable(fid, false);
-      do_read = true;
-    }
-  }  // 释放 bpm_latch_
+    replacer_->RecordAccess(frame_id);
+    replacer_->SetEvictable(frame_id, false);
+    frame->pin_count_++;
 
-  if (do_read) {
-    auto p = disk_scheduler_->CreatePromise();
-    auto f = p.get_future();
-    disk_scheduler_->Schedule({false, frame->GetDataMut(), page_id, std::move(p)});
-    f.get();
+    lk.unlock();
+    return std::make_optional(ReadPageGuard(page_id, frame, replacer_, bpm_latch_));
   }
 
-  // 此时 bpm_latch_ 已被释放，可以安全构造 Guard（Guard 自带加锁逻辑）
-  return ReadPageGuard(page_id, frame, replacer_, bpm_latch_);
-}
+  // 2.页面不在内存中，尝试分配或淘汰帧
+  frame_id_t frame_id;
+  if (!free_frames_.empty()) {
+    frame_id = free_frames_.front();
+    free_frames_.pop_front();
+  } else {
+    auto maybe_evict_id = replacer_->Evict();
+    if (!maybe_evict_id.has_value()) {
+      return std::nullopt;
+    }
 
+    frame_id = maybe_evict_id.value();
+    auto &evict_frame = frames_[frame_id];
+
+    // 处理脏页
+    {
+      std::lock_guard<std::shared_mutex> write_lk(evict_frame->rwlatch_);
+
+      if (evict_frame->is_dirty_) {
+        std::promise<bool> write_promise;
+        auto write_future = write_promise.get_future();
+        disk_scheduler_->Schedule({true, evict_frame->GetDataMut(), evict_frame->page_id_, std::move(write_promise)});
+        if (!write_future.get()) {
+          LOG_ERROR("Disk write failed during page deletion");
+          return std::nullopt;
+        }
+        evict_frame->is_dirty_ = false;
+      }
+    }
+
+    page_table_.erase(evict_frame->page_id_);
+    evict_frame->Reset();
+    replacer_->SetEvictable(frame_id, false);
+  }
+
+  // 3. 从磁盘读取目标页面到刚才分配或淘汰的帧中
+  auto &target_frame = frames_[frame_id];
+  std::unique_lock<std::shared_mutex> read_lk(target_frame->rwlatch_);
+  std::promise<bool> read_promise;
+  auto read_future = read_promise.get_future();
+  disk_scheduler_->Schedule({false, target_frame->GetDataMut(), page_id, std::move(read_promise)});
+  if (!read_future.get()) {
+    // 读盘失败，释放资源
+    LOG_ERROR("读盘失败");
+    free_frames_.push_back(frame_id);
+    replacer_->SetEvictable(frame_id, true);
+    return std::nullopt;
+  }
+
+  // 4. 更新缓冲池元数据
+  page_table_[page_id] = frame_id;
+  target_frame->page_id_ = page_id;
+  target_frame->pin_count_ = 1;
+  target_frame->is_dirty_ = false;
+  replacer_->RecordAccess(frame_id);
+  replacer_->SetEvictable(frame_id, false);
+
+  read_lk.unlock();
+  lk.unlock();
+  return std::make_optional(ReadPageGuard(page_id, target_frame, replacer_, bpm_latch_));
+}
 
 /**
  * @brief A wrapper around `CheckedWritePage` that unwraps the inner value if it exists.
@@ -449,55 +543,108 @@ auto BufferPoolManager::ReadPage(page_id_t page_id, AccessType access_type) -> R
   return std::move(guard_opt).value();
 }
 
+
 /**
- * @brief Flushes a page's data out to disk.
+ * @brief Flushes a page's data out to disk safely.
  *
- * This function will write out a page's data to disk if it has been modified. If the given page is not in memory, this
- * function will return `false`.
+ * This function will write out a page's data to disk if it has been modified. If the given page is not in memory,
+ * this function will return `false`.
+ *
+ * You should take a lock on the page in this function to ensure that a consistent state is flushed to disk.
  *
  * ### Implementation
  *
- * You should probably leave implementing this function until after you have completed `CheckedReadPage` and
- * `CheckedWritePage`, as it will likely be much easier to understand what to do.
+ * You should probably leave implementing this function until after you have completed `CheckedReadPage`,
+ * `CheckedWritePage`, and `Flush` in the page guards, as it will likely be much easier to understand what to do.
  *
  * TODO(P1): Add implementation
  *
  * @param page_id The page ID of the page to be flushed.
  * @return `false` if the page could not be found in the page table, otherwise `true`.
  */
+// auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
+//   std::scoped_lock<std::mutex> lk(*bpm_latch_);
+//   auto it = page_table_.find(page_id);
+//   if (it == page_table_.end()) {
+//     return false;
+//   }
+//   frame_id_t frame_id = it->second;
+//   auto &frame = frames_[frame_id];
+
+//   // 获取帧的写锁，确保刷新时独占访问
+//   std::lock_guard<std::shared_mutex> write_lk(frame->rwlatch_);
+
+//   if (frame->is_dirty_) {
+//     std::promise<bool> write_promise;
+//     auto write_future = write_promise.get_future();
+//     disk_scheduler_->Schedule({true, frame->GetDataMut(), page_id, std::move(write_promise)});
+
+//     if (write_future.get()) {
+//       frame->is_dirty_ = false;  // 清除脏页标志
+//       return true;
+//     }
+//     LOG_ERROR("Failed to flush page %d to disk", page_id);
+//     return false;
+//   }
+
+//   return true;
+// }
+
 auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
-  std::shared_ptr<FrameHeader>frame;
-  {std::lock_guard<std::mutex> lock(*bpm_latch_);
-  
+  // LOG_DEBUG("刷新页");
+  // 先获取全局锁，查找页面所在帧
+  std::unique_lock<std::mutex> lk(*bpm_latch_);
+
   auto it = page_table_.find(page_id);
   if (it == page_table_.end()) {
-    return false;  // 页面不在内存中
+    // LOG_DEBUG("Page %d not found in page table", page_id);
+    return false;
   }
+
   frame_id_t frame_id = it->second;
-  frame = frames_[frame_id];
-}
-  if (frame->is_dirty_) {
-    auto p = disk_scheduler_->CreatePromise();
-    auto fut = p.get_future();
-    DiskRequest write_request;
-    write_request.page_id_ = page_id;
-    write_request.is_write_ = true;
-    write_request.data_ = frame->GetDataMut();
-    write_request.callback_=std::move(p);
-    disk_scheduler_->Schedule(std::move(write_request));
-    fut.get();
-    frame->is_dirty_ = false;  // 标记为不脏
+  auto &frame = frames_[frame_id];
 
+  lk.unlock();
+  // 获取帧的写锁，确保刷新时独占访问
+  // std::unique_lock<std::shared_mutex> write_lk(frame->rwlatch_);
+
+  // if (!frame->is_dirty_) {
+  //   LOG_DEBUG("Page %d is not dirty, skipping flush", page_id);
+  //   return false;
+  // }
+
+  // 创建写操作的promise和future
+  std::promise<bool> write_promise;
+  auto write_future = write_promise.get_future();
+
+  // 提交写操作到磁盘调度器
+  try {
+    disk_scheduler_->Schedule({true, frame->GetDataMut(), page_id, std::move(write_promise)});
+  } catch (const std::exception &e) {
+    LOG_ERROR("Failed to schedule disk write for page %d: %s", page_id, e.what());
+    return false;
   }
 
+  // 等待写操作完成
+  try {
+    if (write_future.get()) {
+      frame->is_dirty_ = false;
+      // LOG_DEBUG("Successfully flushed page %d to disk", page_id);
+      return true;
+    }
+  } catch (const std::exception &e) {
+    LOG_ERROR("Exception during disk write for page %d: %s", page_id, e.what());
+  }
 
-  
-  
-  return true;
+  LOG_ERROR("Failed to flush page %d to disk", page_id);
+  return false;
 }
+
 
 /**
- * @brief Flushes all page data that is in memory to disk.
+ * @brief Flushes all page data that is in memory to disk safely.
+ *
+ * You should take locks on the pages in this function to ensure that a consistent state is flushed to disk.
  *
  * ### Implementation
  *
@@ -506,44 +653,43 @@ auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
  *
  * TODO(P1): Add implementation
  */
-void BufferPoolManager::FlushAllPages() { 
-  std::vector<std::pair<page_id_t, std::shared_ptr<FrameHeader>>> todo;
-  { std::lock_guard<std::mutex> g(*bpm_latch_);
-    for (auto &[pid, fid] : page_table_) {
-      if(!frames_[fid]->is_dirty_)continue;
-      todo.emplace_back(pid, frames_[fid]);   // 收集 (page_id, frame)
+void BufferPoolManager::FlushAllPages() {
+  // LOG_DEBUG("刷新全部页");
+  std::scoped_lock<std::mutex> lk(*bpm_latch_);
+
+  for (const auto &[page_id, frame_id] : page_table_) {
+    auto &frame = frames_[frame_id];
+    {
+      // std::unique_lock<std::shared_mutex> write_lock(frame->rwlatch_);
+
+      std::promise<bool> write_promise;
+      auto write_future = write_promise.get_future();
+      disk_scheduler_->Schedule({true, frame->GetDataMut(), page_id, std::move(write_promise)});
+
+      if (write_future.get()) {
+        frame->is_dirty_ = false;
+      } else {
+        LOG_ERROR("Failed to flush page %d to disk", page_id);
+      }
     }
-  } 
-  for(auto&[page_id,frame]:todo){
-    
-    auto p = disk_scheduler_->CreatePromise();
-    auto fut = p.get_future();
-    DiskRequest r;
-    r.is_write_=true;
-    r.data_=frame->GetDataMut();
-    r.page_id_=page_id;
-    r.callback_=std::move(p);
-    disk_scheduler_->Schedule(std::move(r));
-    fut.get();
-    frame->is_dirty_=false;
   }
 }
 
 /**
  * @brief Retrieves the pin count of a page. If the page does not exist in memory, return `std::nullopt`.
  *
- * This function is thread safe. Callers may invoke this function in a multi-threaded environment where multiple threads
- * access the same page.
+ * This function is thread safe. Callers may invoke this function in a multi-threaded environment where multiple
+ * threads access the same page.
  *
- * This function is intended for testing purposes. If this function is implemented incorrectly, it will definitely cause
- * problems with the test suite and autograder.
+ * This function is intended for testing purposes. If this function is implemented incorrectly, it will definitely
+ * cause problems with the test suite and autograder.
  *
  * # Implementation
  *
  * We will use this function to test if your buffer pool manager is managing pin counts correctly. Since the
- * `pin_count_` field in `FrameHeader` is an atomic type, you do not need to take the latch on the frame that holds the
- * page we want to look at. Instead, you can simply use an atomic `load` to safely load the value stored. You will still
- * need to take the buffer pool latch, however.
+ * `pin_count_` field in `FrameHeader` is an atomic type, you do not need to take the latch on the frame that holds
+ * the page we want to look at. Instead, you can simply use an atomic `load` to safely load the value stored. You
+ * will still need to take the buffer pool latch, however.
  *
  * Again, if you are unfamiliar with atomic types, see the official C++ docs
  * [here](https://en.cppreference.com/w/cpp/atomic/atomic).
@@ -554,14 +700,19 @@ void BufferPoolManager::FlushAllPages() {
  * @return std::optional<size_t> The pin count if the page exists, otherwise `std::nullopt`.
  */
 auto BufferPoolManager::GetPinCount(page_id_t page_id) -> std::optional<size_t> {
-  std::lock_guard<std::mutex>lock(*bpm_latch_);
-  auto it=page_table_.find(page_id);
-  if(it==page_table_.end()){
+  // LOG_DEBUG("获取引用计数");
+  std::scoped_lock<std::mutex> lk(*bpm_latch_);
+
+  // 页面是否存在于页表中
+  auto it = page_table_.find(page_id);
+  if (it == page_table_.end()) {
     return std::nullopt;
   }
-  frame_id_t frame_id=it->second;
-  auto frame=frames_[frame_id];
-  return frame->pin_count_.load();
+
+  frame_id_t frame_id = it->second;
+  auto &frame = frames_[frame_id];
+
+  return std::make_optional(static_cast<size_t>(frame->pin_count_.load()));
 }
 
 }  // namespace bustub

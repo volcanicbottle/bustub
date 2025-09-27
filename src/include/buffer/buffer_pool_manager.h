@@ -70,6 +70,9 @@ class FrameHeader {
    * currently storing. This might allow you to skip searching for the corresponding (page ID, frame ID) pair somewhere
    * else in the buffer pool manager...
    */
+
+  /** @brief The page ID of the page currently stored in this frame. */
+  page_id_t page_id_ = INVALID_PAGE_ID;
   
   // I/O synchronization fields
   std::mutex m_;
