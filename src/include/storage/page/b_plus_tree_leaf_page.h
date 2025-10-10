@@ -67,7 +67,10 @@ class BPlusTreeLeafPage : public BPlusTreePage {
   auto ValueAt(int index) const -> ValueType;
   void SetKeyAt(int index, const KeyType &key);
   void SetValueAt(int index, const ValueType &value);
-
+  auto Lookup(const KeyType &key, ValueType *value, const KeyComparator &comparator) const -> bool;
+  auto Insert(const KeyType &key, const ValueType &value, const KeyComparator &comparator) -> int;
+  void MoveHalfTo(BPlusTreeLeafPage *recipient);
+  void MoveAllTo(BPlusTreeLeafPage *recipient);//把当前页的所有 <key,value> 追加到兄弟页尾部，更新 next_page_id_。
   /**
    * @brief For test only return a string representing all keys in
    * this leaf page formatted as "(key1,key2,key3,...)"

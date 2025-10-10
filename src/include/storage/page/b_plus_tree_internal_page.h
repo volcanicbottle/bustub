@@ -80,6 +80,77 @@ class BPlusTreeInternalPage : public BPlusTreePage {
   auto ValueAt(int index) const -> ValueType;
 
   /**
+   * @param index The index to set
+   * @param value The new value
+   */
+  void SetValueAt(int index, const ValueType &value);
+
+  /**
+   * @brief Find the index of the key using binary search
+   * @param key The key to search for
+   * @param comparator The key comparator
+   * @return The index where the key should be inserted
+   */
+  auto KeyIndex(const KeyType &key, const KeyComparator &comparator) const -> int;
+
+  /**
+   * @brief Lookup the value for a given key
+   * @param key The key to lookup
+   * @param comparator The key comparator
+   * @return The value (page_id) for the key
+   */
+  auto Lookup(const KeyType &key, const KeyComparator &comparator) const -> ValueType;
+
+  /**
+   * @brief Insert a new key-value pair after an existing value
+   * @param old_value The existing value to insert after
+   * @param new_key The new key
+   * @param new_value The new value
+   * @return The new size
+   */
+  auto InsertNodeAfter(const ValueType &old_value, const KeyType &new_key, const ValueType &new_value) -> int;
+
+  /**
+   * @brief Remove a value at the specified index
+   * @param index The index to remove
+   */
+  void Remove(int index);
+
+  /**
+   * @brief Remove and return the only child (for root shrinking)
+   * @return The only child value
+   */
+  auto RemoveAndReturnOnlyChild() -> ValueType;
+
+  /**
+   * @brief Move half of the entries to another page (for splitting)
+   * @param recipient The page to move entries to
+   */
+  void MoveHalfTo(BPlusTreeInternalPage *recipient);
+
+  /**
+   * @brief Copy n entries from another page
+   * @param donor The source page
+   * @param start_value_index The starting index in donor
+   * @param n The number of entries to copy
+   */
+  void CopyNFrom(const BPlusTreeInternalPage *donor, int start_value_index, int n);
+
+  /**
+   * @brief Move all entries to another page (for merging)
+   * @param recipient The page to move entries to
+   */
+  void MoveAllTo(BPlusTreeInternalPage *recipient);
+
+  /**
+   * @brief Populate a new root with two children
+   * @param old_value The first child
+   * @param new_key The key between children
+   * @param new_value The second child
+   */
+  void PopulateNewRoot(const ValueType &old_value, const KeyType &new_key, const ValueType &new_value);
+
+  /**
    * @brief For test only, return a string representing all keys in
    * this internal page, formatted as "(key1,key2,key3,...)"
    *
